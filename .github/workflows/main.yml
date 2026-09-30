@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  # main and pull requests, not every branch: pushing a branch and then opening
+  # a pull request for it built the same commit twice, and the two runs do not
+  # share a concurrency group (a push ref and a pull request ref are different),
+  # so neither cancelled the other — 18 checks on one commit, for nine jobs.
+  # A branch with no pull request yet still builds on demand, through the
+  # dispatch below, and the release path comes in through `workflow_call`.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      stubs:
+        description: 'Build the per-language export stubs too (slow; the release matrix)'
+        type: boolean
+        default: false
+  workflow_call:
+    # The android job signs the release APK with these. A reusable workflow
+    # receives no repository secrets unless its caller names them, so
+    # release.yml has to pass them — and `required` makes a caller that does
+    # not fail at the start of the run instead of inside the signing step.
+    # Before 15.09 the passwords lived in the tree and reached every flavor
+    # of this workflow alike; moving them into secrets cut the tag path off,
+    # because that path is the only one that goes through a call.
+    secrets:
+      RELEASE_STORE_PASSWORD:
+        required: true
+      RELEASE_KEY_PASSWORD:
+        required: true
+
+# A new push supersedes the previous run on the same ref: cancel it instead
+# of burning matrix runners on stale commits.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # === Windows ===
+  windows:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 2.6
+
+      - name: Build
+        shell: cmd
+        run: |
+          cd build
+          cmake -G "Visual Studio 17 2022" -DBUILD_SDLGPU=On -DBUILD_STATIC=ON -DBUILD_PRO=On -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_ALL=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+          cmake --build . --config Release --parallel || exit /b 1
+          rem The universal export stub is this same binary (console.c appends
+          rem the cart to it), so keep it before Build Pro overwrites it below.
+          rem It goes into a directory of its own: upload-artifact names the file
+          rem in the artifact by its basename, and package.sh looks for tic80.exe
+          rem in there — a file called tic80-export.exe would fail packaging.
+          if not exist "%GITHUB_WORKSPACE%\stub" mkdir "%GITHUB_WORKSPACE%\stub"
+          copy /Y bin\tic80.exe "%GITHUB_WORKSPACE%\stub\tic80.exe" || exit /b 1
+
+      - name: Deploy
+        uses: actions/upload-artifact@v6
+        with:
+          if-no-files-found: error
+          name: "tic80-windows"
+          path: |
+            build/bin/tic80.exe
